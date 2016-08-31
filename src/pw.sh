@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 
 # Copyright (C) 2012 - 2014 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
-# This file is licensed under the GPLv2+. Please see COPYING for more information.
+# Copyright (C) 2016 Dan Panzarella <alsoelp@gmail.com>.
+# This file is licensed under the GPLv2. Please see LICENSE for more information.
 
 umask "${PASSWORD_STORE_UMASK:-077}"
 set -o pipefail
@@ -17,25 +18,10 @@ X_SELECTION="${PASSWORD_STORE_X_SELECTION:-clipboard}"
 CLIP_TIME="${PASSWORD_STORE_CLIP_TIME:-45}"
 GENERATED_LENGTH="${PASSWORD_STORE_GENERATED_LENGTH:-25}"
 
-export GIT_DIR="${PASSWORD_STORE_GIT:-$PREFIX}/.git"
-export GIT_WORK_TREE="${PASSWORD_STORE_GIT:-$PREFIX}"
-
 #
 # BEGIN helper functions
 #
 
-git_add_file() {
-	[[ -d $GIT_DIR ]] || return
-	git add "$1" || return
-	[[ -n $(git status --porcelain "$1") ]] || return
-	git_commit "$2"
-}
-git_commit() {
-	local sign=""
-	[[ -d $GIT_DIR ]] || return
-	[[ $(git config --bool --get pass.signcommits) == "true" ]] && sign="-S"
-	git commit $sign -m "$1"
-}
 yesno() {
 	[[ -t 0 ]] || return 0
 	local response
@@ -196,18 +182,7 @@ SHRED="shred -f -z"
 #
 
 cmd_version() {
-	cat <<-_EOF
-	============================================
-	= pass: the standard unix password manager =
-	=                                          =
-	=                  v1.6.5                  =
-	=                                          =
-	=             Jason A. Donenfeld           =
-	=               Jason@zx2c4.com            =
-	=                                          =
-	=      http://www.passwordstore.org/       =
-	============================================
-	_EOF
+	echo "pw v1.7"
 }
 
 cmd_usage() {
@@ -551,23 +526,6 @@ cmd_copy_move() {
 	fi
 }
 
-cmd_git() {
-	if [[ $1 == "init" ]]; then
-		git "$@" || exit 1
-		git_add_file "$PREFIX" "Add current contents of password store."
-
-		echo '*.gpg diff=gpg' > "$PREFIX/.gitattributes"
-		git_add_file .gitattributes "Configure git repository for gpg file diff."
-		git config --local diff.gpg.binary true
-		git config --local diff.gpg.textconv "$GPG -d ${GPG_OPTS[*]}"
-	elif [[ -d $GIT_DIR ]]; then
-		tmpdir nowarn #Defines $SECURE_TMPDIR. We don't warn, because at most, this only copies encrypted files.
-		export TMPDIR="$SECURE_TMPDIR"
-		git "$@"
-	else
-		die "Error: the password store is not a git repository. Try \"$PROGRAM git init\"."
-	fi
-}
 
 #
 # END subcommand functions
