@@ -6,103 +6,161 @@
 
 umask "${PASSWORD_STORE_UMASK:-077}"
 set -o pipefail
+#set -x
+set -e
 
-GPG_OPTS=( $PASSWORD_STORE_GPG_OPTS "--quiet" "--yes" "--compress-algo=none" "--no-encrypt-to" )
+GPG_OPTS=( $PW_GPG_OPTS "--quiet" "--yes" "--compress-algo=none" "--no-encrypt-to" )
 GPG="gpg"
 export GPG_TTY="${GPG_TTY:-$(tty 2>/dev/null)}"
 which gpg2 &>/dev/null && GPG="gpg2"
-[[ -n $GPG_AGENT_INFO || $GPG == "gpg2" ]] && GPG_OPTS+=( "--batch" "--use-agent" )
+[[ -n $GPG_AGENT_INFO || $GPG == "gpg2" ]] && GPG_OPTS+=( "--batch" )
 
-PREFIX="${XDG_DATA_HOME:-$HOME/.local/share}/pw"
-X_SELECTION="${PASSWORD_STORE_X_SELECTION:-clipboard}"
-CLIP_TIME="${PASSWORD_STORE_CLIP_TIME:-45}"
+CLIP_TIME="${PASSWORD_STORE_CLIP_TIME:-5}"
 GENERATED_LENGTH="${PASSWORD_STORE_GENERATED_LENGTH:-25}"
+
+
+FLNAME="pw"
+TMPDIR="/dev/shm"
+ENCDIR="${XDG_DATA_HOME:-$HOME/.local/share}"
+EDITOR="${EDITOR:-vi}"
+
 
 #
 # BEGIN helper functions
 #
 
-yesno() {
-	[[ -t 0 ]] || return 0
+approve() {
 	local response
-	read -r -p "$1 [y/N] " response
-	[[ $response == [yY] ]] || exit 1
+	if [ -t 0 ]; then
+		read -r -p "$1 [y/N] " response
+		[[ $response == [yY] ]] || return 1
+		return 0
+	else
+		response="$(pinentry-gtk-2 <<EOD
+setdesc $1
+settitle pw
+setok Yes
+setcancel No
+confirm
+EOD
+)"
+		echo "$response" | grep "^ERR.*cancelled" && return 1
+		return 0
+	fi
 }
+
+say() {
+	if [ -t 0 ]; then
+		echo "$@"
+	else
+		pinentry-gtk-2 <<EOD
+setdesc $@
+settitle pw
+message
+EOD
+	fi
+}
+
 die() {
-	echo "$@" >&2
+	if [ -t 0 ]; then
+		echo "$@" >&2
+	else
+		pinentry-gtk-2 <<EOD
+setdesc $@
+settitle pw error
+message
+EOD
+	fi
+	cleanup
 	exit 1
 }
-set_gpg_recipients() {
-	GPG_RECIPIENT_ARGS=( )
-	GPG_RECIPIENTS=( )
 
-	if [[ -n $PASSWORD_STORE_KEY ]]; then
-		for gpg_id in $PASSWORD_STORE_KEY; do
-			GPG_RECIPIENT_ARGS+=( "-r" "$gpg_id" )
-			GPG_RECIPIENTS+=( "$gpg_id" )
-		done
-		return
+askkey() {
+	if [ -t 0 ]; then
+		read -s -p "$1: " USER_PW || return 1
+		printf "\n"
+		#echo -ne "\033[1G\033[2K" #erases pass line
+	else
+		local answers
+		answers="$( pinentry-gnome3 <<EOD
+setdesc $1
+setprompt pass:
+settitle pw
+setok OK
+setcancel Cancel
+getpin
+EOD
+)"
+		echo "$answers" | grep "^ERR" && return 1
+		USER_PW="$( echo "$answers" | grep "^D " | awk '{print $2}' )"
 	fi
+}
+dblask() {
+	if [ -t 0 ]; then
+		local pass repeated
+		read -s -p "$1: " pass || return 1
+		printf "\n"
+		read -s -p "Repeat: " repeated || return 1
+		printf "\n"
 
-	local current="$PREFIX/$1"
-	while [[ $current != "$PREFIX" && ! -f $current/.gpg-id ]]; do
-		current="${current%/*}"
+		if [[ $pass == "$repeated" ]]; then
+			USER_PW="$pass"
+		else
+			return 1
+		fi
+	else
+		local answers
+		answers="$( pinentry-gnome3 <<EOD
+setdesc $1
+setprompt pass:
+settitle pw
+setok OK
+setcancel Cancel
+setrepeat
+getpin
+EOD
+)"
+		grep "^ERR" <<< "$answers" && return 1
+		USER_PW="$( echo "$answers" | grep "^D " | awk '{print $2}' )"
+	fi	
+}
+
+decrypt() {
+	[[ -d "${TMPDIR}/${FLNAME}" ]] && return 0 #already decrypted from previous
+	[[ -f "${ENCDIR}/${FLNAME}" ]] || die "Error: no encrypted library found. Create entries first"
+	file -b "${ENCDIR}/${FLNAME}" | grep "GPG.*encrypted" >/dev/null 2>&1 || die "Error: library was not encrypted"
+
+	askkey "Enter decryption key" || die "Decryption key required"
+	gpg -d  --pinentry-mode loopback --passphrase "$USER_PW" "${ENCDIR}/${FLNAME}" 2>/dev/null | tar -C "${TMPDIR}" -xj 2>/dev/null || die "bad password"
+}
+
+encrypt() {
+	[[ -d "${TMPDIR}/${FLNAME}" ]] || die "Error: no information to encrypt"
+
+	while [[ -z "$USER_PW" ]]; do
+		dblask "Enter new master encryption key" || say "key required"
 	done
-	current="$current/.gpg-id"
-
-	if [[ ! -f $current ]]; then
-		cat >&2 <<-_EOF
-		Error: You must run:
-		    $PROGRAM init your-gpg-id
-		before you may use the password store.
-
-		_EOF
-		cmd_usage
-		exit 1
-	fi
-
-	local gpg_id
-	while read -r gpg_id; do
-		GPG_RECIPIENT_ARGS+=( "-r" "$gpg_id" )
-		GPG_RECIPIENTS+=( "$gpg_id" )
-	done < "$current"
+	tar -C "${TMPDIR}" -cj "${FLNAME}" | gpg -c "${GPG_OPTS[@]}" -o "${ENCDIR}/${FLNAME}" --pinentry-mode loopback --passphrase "$USER_PW"
+	cleanup
 }
 
-reencrypt_path() {
-	local prev_gpg_recipients="" gpg_keys="" current_keys="" index passfile
-	local groups="$($GPG $PASSWORD_STORE_GPG_OPTS --list-config --with-colons | grep "^cfg:group:.*")"
-	while read -r -d "" passfile; do
-		local passfile_dir="${passfile%/*}"
-		passfile_dir="${passfile_dir#$PREFIX}"
-		passfile_dir="${passfile_dir#/}"
-		local passfile_display="${passfile#$PREFIX/}"
-		passfile_display="${passfile_display%.gpg}"
-		local passfile_temp="${passfile}.tmp.${RANDOM}.${RANDOM}.${RANDOM}.${RANDOM}.--"
-
-		set_gpg_recipients "$passfile_dir"
-		if [[ $prev_gpg_recipients != "${GPG_RECIPIENTS[*]}" ]]; then
-			for index in "${!GPG_RECIPIENTS[@]}"; do
-				local group="$(sed -n "s/^cfg:group:$(sed 's/[\/&]/\\&/g' <<<"${GPG_RECIPIENTS[$index]}"):\\(.*\\)\$/\\1/p" <<<"$groups" | head -n 1)"
-				[[ -z $group ]] && continue
-				IFS=";" eval 'GPG_RECIPIENTS+=( $group )' # http://unix.stackexchange.com/a/92190
-				unset GPG_RECIPIENTS[$index]
-			done
-			gpg_keys="$($GPG $PASSWORD_STORE_GPG_OPTS --list-keys --with-colons "${GPG_RECIPIENTS[@]}" | sed -n 's/sub:[^:]*:[^:]*:[^:]*:\([^:]*\):[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:[^:]*:[a-zA-Z]*e[a-zA-Z]*:.*/\1/p' | LC_ALL=C sort -u)"
-		fi
-		current_keys="$($GPG $PASSWORD_STORE_GPG_OPTS -v --no-secmem-warning --no-permission-warning --list-only --keyid-format long "$passfile" 2>&1 | cut -d ' ' -f 5 | LC_ALL=C sort -u)"
-
-		if [[ $gpg_keys != "$current_keys" ]]; then
-			echo "$passfile_display: reencrypting to ${gpg_keys//$'\n'/ }"
-			$GPG -d "${GPG_OPTS[@]}" "$passfile" | $GPG -e "${GPG_RECIPIENT_ARGS[@]}" -o "$passfile_temp" "${GPG_OPTS[@]}" &&
-			mv "$passfile_temp" "$passfile" || rm -f "$passfile_temp"
-		fi
-		prev_gpg_recipients="${GPG_RECIPIENTS[*]}"
-	done < <(find "$1" -iname '*.gpg' -print0)
+createlib() {
+	dblask "Enter new master encryption key" || die "key required"
+	mkdir -p "${TMPDIR}/${FLNAME}"
 }
+
+cleanup() {
+	[[ -d "${TMPDIR}/${FLNAME}" ]] || exit 0
+	find "${TMPDIR}/${FLNAME}" -type f -exec shred -fzu {} +
+	rm -rf "${TMPDIR}/${FLNAME}"
+}
+
 check_sneaky_paths() {
 	local path
 	for path in "$@"; do
-		[[ $path =~ /\.\.$ || $path =~ ^\.\./ || $path =~ /\.\./ || $path =~ ^\.\.$ ]] && die "Error: You've attempted to pass a sneaky path to pass. Go home."
+		if [[ $path =~ /\.\.$ || $path =~ ^\.\./ || $path =~ /\.\./ || $path =~ ^\.\.$ ]]; then
+			die "Error: You've attempted to pass a sneaky path to pass. Go home."
+		fi
 	done
 }
 
@@ -120,57 +178,20 @@ clip() {
 	# trailing new lines.
 	local sleep_argv0="password store sleep on display $DISPLAY"
 	pkill -f "^$sleep_argv0" 2>/dev/null && sleep 0.5
-	local before="$(xclip -o -selection "$X_SELECTION" 2>/dev/null | base64)"
-	echo -n "$1" | xclip -selection "$X_SELECTION" || die "Error: Could not copy data to the clipboard"
+	local before="$(xclip -o -selection clipboard 2>/dev/null | base64)"
+	echo -n "$1" | xclip -selection clipboard || die "Error: Could not copy data to the clipboard"
 	(
 		( exec -a "$sleep_argv0" sleep "$CLIP_TIME" )
-		local now="$(xclip -o -selection "$X_SELECTION" | base64)"
+		local now="$(xclip -o -selection clipboard | base64)"
 		[[ $now != $(echo -n "$1" | base64) ]] && before="$now"
-
-		# It might be nice to programatically check to see if klipper exists,
-		# as well as checking for other common clipboard managers. But for now,
-		# this works fine -- if qdbus isn't there or if klipper isn't running,
-		# this essentially becomes a no-op.
-		#
-		# Clipboard managers frequently write their history out in plaintext,
-		# so we axe it here:
-		qdbus org.kde.klipper /klipper org.kde.klipper.klipper.clearClipboardHistory &>/dev/null
-
-		echo "$before" | base64 -d | xclip -selection "$X_SELECTION"
+		echo "$before" | base64 -d | xclip -selection clipboard
 	) 2>/dev/null & disown
-	echo "Copied $2 to clipboard. Will clear in $CLIP_TIME seconds."
-}
-tmpdir() {
-	[[ -n $SECURE_TMPDIR ]] && return
-	local warn=1
-	[[ $1 == "nowarn" ]] && warn=0
-	local template="$PROGRAM.XXXXXXXXXXXXX"
-	if [[ -d /dev/shm && -w /dev/shm && -x /dev/shm ]]; then
-		SECURE_TMPDIR="$(mktemp -d "/dev/shm/$template")"
-		remove_tmpfile() {
-			rm -rf "$SECURE_TMPDIR"
-		}
-		trap remove_tmpfile INT TERM EXIT
+	if [ -t 0 ]; then
+		echo "Copied $2 to clipboard. Will clear in $CLIP_TIME seconds."
 	else
-		[[ $warn -eq 1 ]] && yesno "$(cat <<-_EOF
-		Your system does not have /dev/shm, which means that it may
-		be difficult to entirely erase the temporary non-encrypted
-		password file after editing.
-
-		Are you sure you would like to continue?
-		_EOF
-		)"
-		SECURE_TMPDIR="$(mktemp -d "${TMPDIR:-/tmp}/$template")"
-		shred_tmpfile() {
-			find "$SECURE_TMPDIR" -type f -exec $SHRED {} +
-			rm -rf "$SECURE_TMPDIR"
-		}
-		trap shred_tmpfile INT TERM EXIT
+		notify-send "pw" "Copied $2 to clipboard. Will clear in $CLIP_TIME seconds."
 	fi
-
 }
-GETOPT="getopt"
-SHRED="shred -f -z"
 
 #
 # END platform definable
@@ -190,9 +211,6 @@ cmd_usage() {
 	echo
 	cat <<-_EOF
 	Usage:
-	    $PROGRAM init [--path=subfolder,-p subfolder] gpg-id...
-	        Initialize new password storage and use gpg-id for encryption.
-	        Selectively reencrypt existing passwords using new gpg-id.
 	    $PROGRAM [ls] [subfolder]
 	        List passwords.
 	    $PROGRAM find pass-names...
@@ -219,9 +237,6 @@ cmd_usage() {
 	        Renames or moves old-path to new-path, optionally forcefully, selectively reencrypting.
 	    $PROGRAM cp [--force,-f] old-path new-path
 	        Copies old-path to new-path, optionally forcefully, selectively reencrypting.
-	    $PROGRAM git git-command-args...
-	        If the password store is a git repository, execute a git command
-	        specified by git-command-args.
 	    $PROGRAM help
 	        Show this text.
 	    $PROGRAM version
@@ -231,149 +246,117 @@ cmd_usage() {
 	_EOF
 }
 
-cmd_init() {
-	local opts id_path=""
-	opts="$($GETOPT -o p: -l path: -n "$PROGRAM" -- "$@")"
-	local err=$?
-	eval set -- "$opts"
-	while true; do case $1 in
-		-p|--path) id_path="$2"; shift 2 ;;
-		--) shift; break ;;
-	esac done
-
-	[[ $err -ne 0 || $# -lt 1 ]] && die "Usage: $PROGRAM $COMMAND [--path=subfolder,-p subfolder] gpg-id..."
-	[[ -n $id_path ]] && check_sneaky_paths "$id_path"
-	[[ -n $id_path && ! -d $PREFIX/$id_path && -e $PREFIX/$id_path ]] && die "Error: $PREFIX/$id_path exists but is not a directory."
-
-	local gpg_id="$PREFIX/$id_path/.gpg-id"
-
-	if [[ $# -eq 1 && -z $1 ]]; then
-		[[ ! -f "$gpg_id" ]] && die "Error: $gpg_id does not exist and so cannot be removed."
-		rm -v -f "$gpg_id" || exit 1
-		if [[ -d $GIT_DIR ]]; then
-			git rm -qr "$gpg_id"
-			git_commit "Deinitialize ${gpg_id}${id_path:+ ($id_path)}."
-		fi
-		rmdir -p "${gpg_id%/*}" 2>/dev/null
-	else
-		mkdir -v -p "$PREFIX/$id_path"
-		printf "%s\n" "$@" > "$gpg_id"
-		local id_print="$(printf "%s, " "$@")"
-		echo "Password store initialized for ${id_print%, }${id_path:+ ($id_path)}"
-		git_add_file "$gpg_id" "Set GPG id to ${id_print%, }${id_path:+ ($id_path)}."
-	fi
-
-	reencrypt_path "$PREFIX/$id_path"
-	git_add_file "$PREFIX/$id_path" "Reencrypt password store using new GPG id ${id_print%, }${id_path:+ ($id_path)}."
+cmd_list() {
+	local path="$1"
+	check_sneaky_paths "$path"
+	decrypt
+	tree -C -l --noreport "${TMPDIR}/${FLNAME}/${path}" | tail -n +2 | sed -E 's/\.txt(\x1B\[[0-9]+m)?( ->|$)/\1\2/g' #remove .txt at end of line, but keep colors
 }
 
 cmd_show() {
 	local opts clip_location clip=0
-	opts="$($GETOPT -o c:: -l clip:: -n "$PROGRAM" -- "$@")"
+	opts="$(getopt -o c:: -l clip:: -n "$PROGRAM" -- "$@")"
 	local err=$?
 	eval set -- "$opts"
 	while true; do case $1 in
 		-c|--clip) clip=1; clip_location="${2:-1}"; shift 2 ;;
 		--) shift; break ;;
 	esac done
+	clip_location="${clip_location:-1}"
 
 	[[ $err -ne 0 ]] && die "Usage: $PROGRAM $COMMAND [--clip[=line-number],-c[line-number]] [pass-name]"
 
 	local path="$1"
-	local passfile="$PREFIX/$path.gpg"
+	local passfile="${TMPDIR}/${FLNAME}/$path.txt"
 	check_sneaky_paths "$path"
-	if [[ -f $passfile ]]; then
-		if [[ $clip -eq 0 ]]; then
-			$GPG -d "${GPG_OPTS[@]}" "$passfile" || exit $?
+
+	decrypt
+	if [[ -d ${passfile%.txt} ]]; then # "show" a directory by listing contents
+		COMMAND="list"
+		cmd_list "$path"
+	elif [[ -f $passfile ]]; then
+		if [[ $clip -eq 0 && -t 0 ]]; then
+			cat "$passfile"
 		else
 			[[ $clip_location =~ ^[0-9]+$ ]] || die "Clip location '$clip_location' is not a number."
-			local pass="$($GPG -d "${GPG_OPTS[@]}" "$passfile" | tail -n +${clip_location} | head -n 1)"
+			local pass="$(tail -n +${clip_location} "$passfile" | head -n 1)"
 			[[ -n $pass ]] || die "There is no password to put on the clipboard at line ${clip_location}."
 			clip "$pass" "$path"
 		fi
 	elif [[ -d $PREFIX/$path ]]; then
-		if [[ -z $path ]]; then
-			echo "Password Store"
-		else
-			echo "${path%\/}"
-		fi
-		tree -C -l --noreport "$PREFIX/$path" | tail -n +2 | sed -E 's/\.gpg(\x1B\[[0-9]+m)?( ->|$)/\1\2/g' # remove .gpg at end of line, but keep colors
-	elif [[ -z $path ]]; then
-		die "Error: password store is empty. Try \"pass init\"."
+		cmd_list "$path"
 	else
-		die "Error: $path is not in the password store."
+		die "Error: $path was not found."
 	fi
 }
 
 cmd_find() {
 	[[ -z "$@" ]] && die "Usage: $PROGRAM $COMMAND pass-names..."
+	decrypt
 	IFS="," eval 'echo "Search Terms: $*"'
 	local terms="*$(printf '%s*|*' "$@")"
-	tree -C -l --noreport -P "${terms%|*}" --prune --matchdirs --ignore-case "$PREFIX" | tail -n +2 | sed -E 's/\.gpg(\x1B\[[0-9]+m)?( ->|$)/\1\2/g'
+	tree -C -l --noreport -P "${terms%|*}" --prune --matchdirs --ignore-case "${TMPDIR}/${FLNAME}" | tail -n +2 | sed -E 's/\.txt(\x1B\[[0-9]+m)?( ->|$)/\1\2/g'
 }
 
 cmd_grep() {
 	[[ $# -ne 1 ]] && die "Usage: $PROGRAM $COMMAND search-string"
-	local search="$1" passfile grepresults
-	while read -r -d "" passfile; do
-		grepresults="$($GPG -d "${GPG_OPTS[@]}" "$passfile" | grep --color=always "$search")"
-		[ $? -ne 0 ] && continue
-		passfile="${passfile%.gpg}"
-		passfile="${passfile#$PREFIX/}"
-		local passfile_dir="${passfile%/*}/"
-		[[ $passfile_dir == "${passfile}/" ]] && passfile_dir=""
-		passfile="${passfile##*/}"
-		printf "\e[94m%s\e[1m%s\e[0m:\n" "$passfile_dir" "$passfile"
-		echo "$grepresults"
-	done < <(find -L "$PREFIX" -iname '*.gpg' -print0)
+	decrypt
+	grep --color=always -H -nr "$1" "${TMPDIR}/${FLNAME}" | sed "s@${TMPDIR}/${FLNAME}/@@g" # strip out leading 
 }
 
 cmd_insert() {
-	local opts multiline=0 noecho=1 force=0
-	opts="$($GETOPT -o mef -l multiline,echo,force -n "$PROGRAM" -- "$@")"
+	if [ ! -f "${ENCDIR}/${FLNAME}" ]; then
+		if approve "password library not found. Create a new one?"; then
+			createlib
+		else
+			exit 1
+		fi
+	else
+		decrypt
+	fi
+
+	local opts multiline=0 force=0
+	opts="$(getopt -o mf -l multiline,force -n "$PROGRAM" -- "$@")"
 	local err=$?
 	eval set -- "$opts"
 	while true; do case $1 in
 		-m|--multiline) multiline=1; shift ;;
-		-e|--echo) noecho=0; shift ;;
 		-f|--force) force=1; shift ;;
 		--) shift; break ;;
 	esac done
 
-	[[ $err -ne 0 || ( $multiline -eq 1 && $noecho -eq 0 ) || $# -ne 1 ]] && die "Usage: $PROGRAM $COMMAND [--echo,-e | --multiline,-m] [--force,-f] pass-name"
+	[[ $err -ne 0 || $# -ne 1 ]] && die "Usage: $PROGRAM $COMMAND [--multiline,-m] [--force,-f] pass-name"
 	local path="${1%/}"
-	local passfile="$PREFIX/$path.gpg"
+	local passfile="${TMPDIR}/${FLNAME}/${path}.txt"
 	check_sneaky_paths "$path"
 
-	[[ $force -eq 0 && -e $passfile ]] && yesno "An entry already exists for $path. Overwrite it?"
+	if [[ $force -eq 0 && -e $passfile ]]; then
+		approve "An entry already exists for $path. Overwrite it?" || exit 1
+	fi
 
-	mkdir -p -v "$PREFIX/$(dirname "$path")"
-	set_gpg_recipients "$(dirname "$path")"
+	mkdir -p -v "${TMPDIR}/${FLNAME}/$(dirname "$path")"
 
 	if [[ $multiline -eq 1 ]]; then
-		echo "Enter contents of $path and press Ctrl+D when finished:"
-		echo
-		$GPG -e "${GPG_RECIPIENT_ARGS[@]}" -o "$passfile" "${GPG_OPTS[@]}" || die "Password encryption aborted."
-	elif [[ $noecho -eq 1 ]]; then
-		local password password_again
-		while true; do
-			read -r -p "Enter password for $path: " -s password || exit 1
-			echo
-			read -r -p "Retype password for $path: " -s password_again || exit 1
-			echo
-			if [[ $password == "$password_again" ]]; then
-				$GPG -e "${GPG_RECIPIENT_ARGS[@]}" -o "$passfile" "${GPG_OPTS[@]}" <<<"$password" || die "Password encryption aborted."
-				break
-			else
-				die "Error: the entered passwords do not match."
-			fi
-		done
+		$EDITOR "$passfile"
+		if [[ -s $passfile ]]; then
+			encrypt
+		elif [[ -f $passfile ]]; then
+			die "Not saved. Empty password"
+		else
+			die "Not saved. Aborted by user"
+		fi
 	else
-		local password
-		read -r -p "Enter password for $path: " -e password
-		$GPG -e "${GPG_RECIPIENT_ARGS[@]}" -o "$passfile" "${GPG_OPTS[@]}" <<<"$password" || die "Password encryption aborted."
+		local passcache gotpass
+		[[ -n "$USER_PW" ]] && passcache="$USER_PW"
+		if askkey "Enter password for $path"; then
+			echo "$USER_PW" > "$passfile"
+			[[ -n "$passcache" ]] && USER_PW="$passcache"
+			encrypt
+		else
+			[[ -n "$passcache" ]] && USER_PW="$passcache"
+			die "Empty password. Aborted."
+		fi
 	fi
-	git_add_file "$passfile" "Add given password for $path to store."
 }
 
 cmd_edit() {
@@ -381,31 +364,24 @@ cmd_edit() {
 
 	local path="${1%/}"
 	check_sneaky_paths "$path"
-	mkdir -p -v "$PREFIX/$(dirname "$path")"
-	set_gpg_recipients "$(dirname "$path")"
-	local passfile="$PREFIX/$path.gpg"
 
-	tmpdir #Defines $SECURE_TMPDIR
-	local tmp_file="$(mktemp -u "$SECURE_TMPDIR/XXXXXX")-${path//\//-}.txt"
+	decrypt
+	local passfile="${TMPDIR}/${FLNAME}/${path}.txt"
+	[[ -f $passfile ]] || die "${path} not found"
+	$EDITOR $passfile
 
-
-	local action="Add"
-	if [[ -f $passfile ]]; then
-		$GPG -d -o "$tmp_file" "${GPG_OPTS[@]}" "$passfile" || exit 1
-		action="Edit"
+	if [[ -s $passfile ]]; then
+		encrypt
+	elif [[ -f $passfile ]]; then
+		die "${path} cannot have empty password. Remove instead. Aborting edit"
+	else
+		die "Cannot remove ${path} this way. Use rm command. Aborting"
 	fi
-	${EDITOR:-vi} "$tmp_file"
-	[[ -f $tmp_file ]] || die "New password not saved."
-	$GPG -d -o - "${GPG_OPTS[@]}" "$passfile" 2>/dev/null | diff - "$tmp_file" &>/dev/null && die "Password unchanged."
-	while ! $GPG -e "${GPG_RECIPIENT_ARGS[@]}" -o "$passfile" "${GPG_OPTS[@]}" "$tmp_file"; do
-		yesno "GPG encryption failed. Would you like to try again?"
-	done
-	git_add_file "$passfile" "$action password for $path using ${EDITOR:-vi}."
 }
 
 cmd_generate() {
 	local opts clip=0 force=0 symbols="-y" inplace=0
-	opts="$($GETOPT -o ncif -l no-symbols,clip,in-place,force -n "$PROGRAM" -- "$@")"
+	opts="$(getopt -o ncif -l no-symbols,clip,in-place,force -n "$PROGRAM" -- "$@")"
 	local err=$?
 	eval set -- "$opts"
 	while true; do case $1 in
@@ -422,18 +398,17 @@ cmd_generate() {
 	check_sneaky_paths "$path"
 	[[ ! $length =~ ^[0-9]+$ ]] && die "Error: pass-length \"$length\" must be a number."
 	mkdir -p -v "$PREFIX/$(dirname "$path")"
-	set_gpg_recipients "$(dirname "$path")"
 	local passfile="$PREFIX/$path.gpg"
 
-	[[ $inplace -eq 0 && $force -eq 0 && -e $passfile ]] && yesno "An entry already exists for $path. Overwrite it?"
+	[[ $inplace -eq 0 && $force -eq 0 && -e $passfile ]] && approve "An entry already exists for $path. Overwrite it?" || exit 1
 
 	local pass="$(pwgen -s $symbols $length 1)"
 	[[ -n $pass ]] || exit 1
 	if [[ $inplace -eq 0 ]]; then
-		$GPG -e "${GPG_RECIPIENT_ARGS[@]}" -o "$passfile" "${GPG_OPTS[@]}" <<<"$pass" || die "Password encryption aborted."
+		$GPG -e -o "$passfile" "${GPG_OPTS[@]}" <<<"$pass" || die "Password encryption aborted."
 	else
 		local passfile_temp="${passfile}.tmp.${RANDOM}.${RANDOM}.${RANDOM}.${RANDOM}.--"
-		if $GPG -d "${GPG_OPTS[@]}" "$passfile" | sed $'1c \\\n'"$(sed 's/[\/&]/\\&/g' <<<"$pass")"$'\n' | $GPG -e "${GPG_RECIPIENT_ARGS[@]}" -o "$passfile_temp" "${GPG_OPTS[@]}"; then
+		if $GPG -d "${GPG_OPTS[@]}" "$passfile" | sed $'1c \\\n'"$(sed 's/[\/&]/\\&/g' <<<"$pass")"$'\n' | $GPG -e -o "$passfile_temp" "${GPG_OPTS[@]}"; then
 			mv "$passfile_temp" "$passfile"
 		else
 			rm -f "$passfile_temp"
@@ -453,7 +428,7 @@ cmd_generate() {
 
 cmd_delete() {
 	local opts recursive="" force=0
-	opts="$($GETOPT -o rf -l recursive,force -n "$PROGRAM" -- "$@")"
+	opts="$(getopt -o rf -l recursive,force -n "$PROGRAM" -- "$@")"
 	local err=$?
 	eval set -- "$opts"
 	while true; do case $1 in
@@ -465,26 +440,27 @@ cmd_delete() {
 	local path="$1"
 	check_sneaky_paths "$path"
 
-	local passdir="$PREFIX/${path%/}"
-	local passfile="$PREFIX/$path.gpg"
+	local passdir="${TMPDIR}/${FLNAME}/${path%/}"
+	local passfile="${TMPDIR}/${FLNAME}/${path}.txt"
+
+	decrypt
+
 	[[ -f $passfile && -d $passdir && $path == */ || ! -f $passfile ]] && passfile="$passdir"
 	[[ -e $passfile ]] || die "Error: $path is not in the password store."
 
-	[[ $force -eq 1 ]] || yesno "Are you sure you would like to delete $path?"
+	[[ $force -eq 1 ]] || approve "Are you sure you would like to delete $path?" || exit 1
 
 	rm $recursive -f -v "$passfile"
-	if [[ -d $GIT_DIR && ! -e $passfile ]]; then
-		git rm -qr "$passfile"
-		git_commit "Remove $path from store."
-	fi
-	rmdir -p "${passfile%/*}" 2>/dev/null
+	rmdir -p "${passfile%/*}" 2>/dev/null || true
+
+	encrypt
 }
 
 cmd_copy_move() {
 	local opts move=1 force=0
 	[[ $1 == "copy" ]] && move=0
 	shift
-	opts="$($GETOPT -o f -l force -n "$PROGRAM" -- "$@")"
+	opts="$(getopt -o f -l force -n "$PROGRAM" -- "$@")"
 	local err=$?
 	eval set -- "$opts"
 	while true; do case $1 in
@@ -526,28 +502,35 @@ cmd_copy_move() {
 	fi
 }
 
+cmd_update() {
+	decrypt
+	unset USER_PW
+	encrypt
+}
 
 #
 # END subcommand functions
 #
 
+trap cleanup INT TERM EXIT
+
 PROGRAM="${0##*/}"
 COMMAND="$1"
 
 case "$1" in
-	init) shift;			cmd_init "$@" ;;
-	help|--help) shift;		cmd_usage "$@" ;;
-	version|--version) shift;	cmd_version "$@" ;;
-	show|ls|list) shift;		cmd_show "$@" ;;
-	find|search) shift;		cmd_find "$@" ;;
-	grep) shift;			cmd_grep "$@" ;;
-	insert|add) shift;		cmd_insert "$@" ;;
-	edit) shift;			cmd_edit "$@" ;;
-	generate) shift;		cmd_generate "$@" ;;
-	delete|rm|remove) shift;	cmd_delete "$@" ;;
-	rename|mv) shift;		cmd_copy_move "move" "$@" ;;
-	copy|cp) shift;			cmd_copy_move "copy" "$@" ;;
-	git) shift;			cmd_git "$@" ;;
-	*) COMMAND="show";		cmd_show "$@" ;;
+	help|-h|--help) shift;			cmd_usage "$@" ;;
+	version|-v|--version) shift;	cmd_version "$@" ;;
+	ls|list) shift;					cmd_list "$@" ;;
+	show) shift;					cmd_show "$@" ;;
+	find|search) shift;				cmd_find "$@" ;;
+	grep) shift;					cmd_grep "$@" ;;
+	insert|add) shift;				cmd_insert "$@" ;;
+	edit) shift;					cmd_edit "$@" ;;
+	generate) shift;				cmd_generate "$@" ;;
+	delete|rm|remove) shift;		cmd_delete "$@" ;;
+	rename|mv) shift;				cmd_copy_move "move" "$@" ;;
+	copy|cp) shift;					cmd_copy_move "copy" "$@" ;;
+	update|up) shift;				cmd_update "$@" ;;
+	*) COMMAND="show";				cmd_show "$@" ;;
 esac
 exit 0
