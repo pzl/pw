@@ -15,7 +15,7 @@ export GPG_TTY="${GPG_TTY:-$(tty 2>/dev/null)}"
 which gpg2 &>/dev/null && GPG="gpg2"
 [[ -n $GPG_AGENT_INFO || $GPG == "gpg2" ]] && GPG_OPTS+=( "--batch" )
 
-CLIP_TIME="${PASSWORD_STORE_CLIP_TIME:-5}"
+CLIP_TIME="${CLIP_TIME:-5}"
 GENERATED_LENGTH="${PASSWORD_STORE_GENERATED_LENGTH:-25}"
 
 
@@ -193,21 +193,29 @@ check_sneaky_paths() {
 # BEGIN platform definable
 #
 
+# Usage: clip password [username] accountlabel
 clip() {
 	# This base64 business is because bash cannot store binary data in a shell
 	# variable. Specifically, it cannot store nulls nor (non-trivally) store
 	# trailing new lines.
 	local sleep_argv0="password store sleep on display $DISPLAY"
 	pkill -f "^$sleep_argv0" 2>/dev/null && sleep 0.5
-	local before="$(xclip -o -selection clipboard 2>/dev/null | base64)"
+	local saved_clip="$(xclip -o -selection clipboard 2>/dev/null | base64)"
+	local saved_alt_clip="$(xclip -o -selection primary 2>/dev/null | base64)"
 	echo -n "$1" | xclip -selection clipboard || die "Error: Could not copy data to the clipboard"
+	if [[ $# -gt 2 ]]; then
+		echo -n "$2" | xclip -selection primary || die "Error: Could not copy data to middle mouse clipboard"
+	fi
 	(
 		( exec -a "$sleep_argv0" sleep "$CLIP_TIME" )
-		local now="$(xclip -o -selection clipboard | base64)"
-		[[ $now != $(echo -n "$1" | base64) ]] && before="$now"
-		echo "$before" | base64 -d | xclip -selection clipboard
+		echo "$saved_clip" | base64 -d | xclip -selection clipboard
+		[[ $# -gt 2 ]] && echo "$saved_alt_clip" | base64 -d | xclip -selection primary
 	) 2>/dev/null & disown
-	say softly "Copied $2 to clipboard. Will clear in $CLIP_TIME seconds."
+	if [[ $# -eq 2 ]]; then
+		say softly "Copied $2 to clipboard. Will clear in $CLIP_TIME seconds."
+	else
+		say softly "Copied $3 to both clipboards. Will clear in $CLIP_TIME seconds"
+	fi
 }
 
 #
@@ -301,8 +309,13 @@ cmd_show() {
 		else
 			[[ $clip_location =~ ^[0-9]+$ ]] || die "Clip location '$clip_location' is not a number."
 			local pass="$(tail -n +${clip_location} "$passfile" | head -n 1)"
+			local pass_alt="$(tail -n +${clip_location} "$passfile" | head -n 2 | tail -n 1 )"
 			[[ -n $pass ]] || die "There is no password to put on the clipboard at line ${clip_location}."
-			clip "$pass" "$path"
+			if [[ -n "$pass_alt" && "$pass_alt" != "\n" ]]; then
+				clip "$pass" "$pass_alt" "$path"
+			else
+				clip "$pass" "$path"
+			fi
 		fi
 	elif [[ -d $PREFIX/$path ]]; then
 		cmd_list "$path"
