@@ -234,9 +234,9 @@ cmd_usage() {
 	    $PROGRAM rm [--recursive,-r] [--force,-f] pass-name
 	        Remove existing password or directory, optionally forcefully.
 	    $PROGRAM mv [--force,-f] old-path new-path
-	        Renames or moves old-path to new-path, optionally forcefully, selectively reencrypting.
+	        Renames or moves old-path to new-path, optionally forcefully
 	    $PROGRAM cp [--force,-f] old-path new-path
-	        Copies old-path to new-path, optionally forcefully, selectively reencrypting.
+	        Copies old-path to new-path, optionally forcefully
 	    $PROGRAM help
 	        Show this text.
 	    $PROGRAM version
@@ -469,36 +469,33 @@ cmd_copy_move() {
 	esac done
 	[[ $# -ne 2 ]] && die "Usage: $PROGRAM $COMMAND [--force,-f] old-path new-path"
 	check_sneaky_paths "$@"
-	local old_path="$PREFIX/${1%/}"
-	local old_dir="$old_path"
-	local new_path="$PREFIX/$2"
 
-	if ! [[ -f $old_path.gpg && -d $old_path && $1 == */ || ! -f $old_path.gpg ]]; then
+	decrypt
+
+	local old_path="${TMPDIR}/${FLNAME}/${1%/}"
+	local old_dir="$old_path"
+	local new_path="${TMPDIR}/${FLNAME}/$2"
+
+	if ! [[ -f ${old_path}.txt && -d $old_path && $1 == */ || ! -f ${old_path}.txt ]]; then
 		old_dir="${old_path%/*}"
-		old_path="${old_path}.gpg"
+		old_path="${old_path}.txt"
 	fi
 	echo "$old_path"
-	[[ -e $old_path ]] || die "Error: $1 is not in the password store."
+	[[ -e $old_path ]] || die "Error: $1 is not in your library."
 
 	mkdir -p -v "${new_path%/*}"
-	[[ -d $old_path || -d $new_path || $new_path == */ ]] || new_path="${new_path}.gpg"
+	[[ -d $old_path || -d $new_path || $new_path == */ ]] || new_path="${new_path}.txt"
 
 	local interactive="-i"
 	[[ ! -t 0 || $force -eq 1 ]] && interactive="-f"
 
 	if [[ $move -eq 1 ]]; then
 		mv $interactive -v "$old_path" "$new_path" || exit 1
-		[[ -e "$new_path" ]] && reencrypt_path "$new_path"
-
-		if [[ -d $GIT_DIR && ! -e $old_path ]]; then
-			git rm -qr "$old_path"
-			git_add_file "$new_path" "Rename ${1} to ${2}."
-		fi
-		rmdir -p "$old_dir" 2>/dev/null
+		rmdir -p "$old_dir" 2>/dev/null || true
+		encrypt
 	else
 		cp $interactive -r -v "$old_path" "$new_path" || exit 1
-		[[ -e "$new_path" ]] && reencrypt_path "$new_path"
-		git_add_file "$new_path" "Copy ${1} to ${2}."
+		encrypt
 	fi
 }
 
