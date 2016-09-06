@@ -161,6 +161,7 @@ createlib() {
 
 cleanup() {
 	[[ -d "${TMPDIR}/${FLNAME}" ]] || exit 0
+	[[ -s "${TMPDIR}/${FLNAME}/unlock" && "$1" == "force" ]] && exit 0
 	find "${TMPDIR}/${FLNAME}" -type f -exec shred -fzu {} +
 	rm -rf "${TMPDIR}/${FLNAME}"
 }
@@ -243,6 +244,10 @@ cmd_usage() {
 	        Renames or moves old-path to new-path, optionally forcefully
 	    $PROGRAM cp [--force,-f] old-path new-path
 	        Copies old-path to new-path, optionally forcefully
+	    $PROGRAM open [--yes,-y] [-t,--timeout SECONDS]
+	    	Decrypts password library and leaves open. Leaves your data un-protected. Very dangerous. Optionally set a timeout to auto close. Use 0 for forever (extra dangerous)
+	    $PROGRAM close [--save,-s]
+	    	Cleans up an open library, optionally saving any changes made while open. Otherwise just securely deletes.
 	    $PROGRAM help
 	        Show this text.
 	    $PROGRAM version
@@ -511,6 +516,52 @@ cmd_update() {
 	encrypt
 }
 
+
+cmd_open() {
+	local skip=0 pw_timeout=10 opts="$(getopt -o yt: -l yes,timeout: -n "$PROGRAM" -- "$@")"
+	eval set -- "$opts"
+	while true; do case $1 in
+		-y|--yes) skip=1; shift ;;
+		-t|--timeout) pw_timeout="$2"; shift 2;;
+		--) shift; break ;;
+	esac done
+	[[ "$skip" -eq 1 ]] || approve "Leaving your password library decrypted in incredibly unsafe. You are responsible for removing it. Continue?" || exit 1
+	decrypt
+	trap - INT TERM EXIT
+	echo "$(date -u)" > "${TMPDIR}/${FLNAME}/unlock" #manual override note
+
+	if [[ $pw_timeout -eq 0 ]]; then
+		say softly "Library unlocked. It will not auto-close. Please '$PRORAM close' when you are finished"
+	else
+		local sleep_argv0="pw-autoclose"
+		#pkill -f "^$sleep_argv0" 2>/dev/null
+		(
+			( exec -a "$sleep_argv0" sleep "$pw_timeout" )
+			cleanup force
+		) 2>/dev/null & disown
+
+		say softly "Library unlocked. Will auto-close in $pw_timeout seconds"
+	fi
+
+
+}
+
+cmd_close() {
+	local save=0 opts="$(getopt -o s -l save -n "$PROGRAM" -- "$@")"
+	eval set -- "$opts"
+	while true; do case $1 in
+		-s|--save) save=1; shift ;;
+		--) shift; break ;;
+	esac done
+
+	if [[ $save -eq 1 ]]; then
+		rm -f "${TMPDIR}/${FLNAME}/unlock" #remove manual override note
+		encrypt
+	else
+		cleanup
+	fi
+}
+
 #
 # END subcommand functions
 #
@@ -534,6 +585,8 @@ case "$1" in
 	rename|mv) shift;				cmd_copy_move "move" "$@" ;;
 	copy|cp) shift;					cmd_copy_move "copy" "$@" ;;
 	update|up) shift;				cmd_update "$@" ;;
+	open|op) shift;					cmd_open "$@" ;;
+	close|cl) shift;				cmd_close "$@" ;;
 	*) COMMAND="show";				cmd_show "$@" ;;
 esac
 exit 0
