@@ -146,12 +146,22 @@ decrypt() {
 
 encrypt() {
 	[[ -d "${TMPDIR}/${FLNAME}" ]] || die "Error: no information to encrypt"
+	[[ -s "${TMPDIR}/${FLNAME}/unlock" ]] && echo "Library unlocked, not saving" && exit 0
 
 	while [[ -z "$USER_PW" ]]; do
 		dblask "Enter new master encryption key" || say "key required"
 	done
 	tar -C "${TMPDIR}" -cj "${FLNAME}" | gpg -c "${GPG_OPTS[@]}" -o "${ENCDIR}/${FLNAME}" --pinentry-mode loopback --passphrase "$USER_PW"
 	cleanup
+}
+
+lock_open() {
+	decrypt
+	trap - INT TERM EXIT
+	echo "$(date -u)" > "${TMPDIR}/${FLNAME}/unlock" #manual override note
+}
+remove_lock() {
+	rm -f "${TMPDIR}/${FLNAME}/unlock"
 }
 
 createlib() {
@@ -161,7 +171,7 @@ createlib() {
 
 cleanup() {
 	[[ -d "${TMPDIR}/${FLNAME}" ]] || exit 0
-	[[ -s "${TMPDIR}/${FLNAME}/unlock" && "$1" == "force" ]] && exit 0
+	[[ -s "${TMPDIR}/${FLNAME}/unlock" ]] && exit 0
 	find "${TMPDIR}/${FLNAME}" -type f -exec shred -fzu {} +
 	rm -rf "${TMPDIR}/${FLNAME}"
 }
@@ -379,10 +389,16 @@ cmd_edit() {
 	decrypt
 	local passfile="${TMPDIR}/${FLNAME}/${path}.txt"
 	[[ -f $passfile ]] || die "${path} not found"
+	local before="$(md5sum $passfile | awk '{print $1}')"
 	$EDITOR $passfile
 
 	if [[ -s $passfile ]]; then
-		encrypt
+		local after="$(md5sum $passfile | awk '{print $1}')"
+		if [[ $before == "$after" ]]; then
+			say "Entry not changed"
+		else
+			encrypt
+		fi
 	elif [[ -f $passfile ]]; then
 		die "${path} cannot have empty password. Remove instead. Aborting edit"
 	else
@@ -526,18 +542,17 @@ cmd_open() {
 		--) shift; break ;;
 	esac done
 	[[ "$skip" -eq 1 ]] || approve "Leaving your password library decrypted in incredibly unsafe. You are responsible for removing it. Continue?" || exit 1
-	decrypt
-	trap - INT TERM EXIT
-	echo "$(date -u)" > "${TMPDIR}/${FLNAME}/unlock" #manual override note
+	lock_open
 
 	if [[ $pw_timeout -eq 0 ]]; then
-		say softly "Library unlocked. It will not auto-close. Please '$PRORAM close' when you are finished"
+		say softly "Library unlocked. It will not auto-close. Please '$PROGRAM close' when you are finished"
 	else
 		local sleep_argv0="pw-autoclose"
 		#pkill -f "^$sleep_argv0" 2>/dev/null
 		(
 			( exec -a "$sleep_argv0" sleep "$pw_timeout" )
-			cleanup force
+			remove_lock
+			cleanup
 		) 2>/dev/null & disown
 
 		say softly "Library unlocked. Will auto-close in $pw_timeout seconds"
@@ -555,9 +570,10 @@ cmd_close() {
 	esac done
 
 	if [[ $save -eq 1 ]]; then
-		rm -f "${TMPDIR}/${FLNAME}/unlock" #remove manual override note
+		remove_lock
 		encrypt
 	else
+		remove_lock
 		cleanup
 	fi
 }
@@ -585,8 +601,8 @@ case "$1" in
 	rename|mv) shift;				cmd_copy_move "move" "$@" ;;
 	copy|cp) shift;					cmd_copy_move "copy" "$@" ;;
 	update|up) shift;				cmd_update "$@" ;;
-	open|op) shift;					cmd_open "$@" ;;
-	close|cl) shift;				cmd_close "$@" ;;
+	open|op|unlock|decrypt) shift;	cmd_open "$@" ;;
+	close|cl|lock|encrypt) shift;	cmd_close "$@" ;;
 	*) COMMAND="show";				cmd_show "$@" ;;
 esac
 exit 0

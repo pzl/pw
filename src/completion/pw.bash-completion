@@ -81,7 +81,7 @@ _pw()
 {
 	COMPREPLY=()
 	local cur="${COMP_WORDS[COMP_CWORD]}"
-	local commands="ls list find grep show insert generate edit rm remove delete rename cp copy up update help version cl close op open"
+	local commands="ls list find grep show insert generate edit rm remove delete rename cp copy up update help version cl close op open lock encrypt unlock decrypt"
 	if [[ $COMP_CWORD -gt 1 ]]; then
 		local lastarg="${COMP_WORDS[$COMP_CWORD-1]}"
 		case "${COMP_WORDS[1]}" in
@@ -108,10 +108,10 @@ _pw()
 				COMPREPLY+=($(compgen -W "-r --recursive -f --force" -- ${cur}))
 				_pass_complete_entries
 				;;
-			op|open)
-				COMPREPLY+=($(compgen -W "-y --yes" -- ${cur}))
+			op|open|unlock|decrypt)
+				COMPREPLY+=($(compgen -W "-y --yes -t --timeout" -- ${cur}))
 				;;
-			cl|close)
+			cl|close|lock|encrypt)
 				COMPREPLY+=($(compgen -W "-s --save" -- ${cur}))
 				;;
 		esac
