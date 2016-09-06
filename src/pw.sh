@@ -15,7 +15,7 @@ export GPG_TTY="${GPG_TTY:-$(tty 2>/dev/null)}"
 which gpg2 &>/dev/null && GPG="gpg2"
 [[ -n $GPG_AGENT_INFO || $GPG == "gpg2" ]] && GPG_OPTS+=( "--batch" )
 
-CLIP_TIME="${CLIP_TIME:-5}"
+CLIP_TIME="${CLIP_TIME:-15}"
 GENERATED_LENGTH="${PASSWORD_STORE_GENERATED_LENGTH:-25}"
 
 
