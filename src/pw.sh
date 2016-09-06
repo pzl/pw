@@ -50,14 +50,24 @@ EOD
 }
 
 say() {
+	local soft=0
+	if [[ "$1" == "softly" ]]; then
+		soft=1
+		shift
+	fi
+
 	if [ -t 0 ]; then
 		echo "$@"
 	else
-		pinentry-gtk-2 <<EOD
+		if [[ $soft -eq 1 ]]; then
+			notify-send "pw" "$@"
+		else
+			pinentry-gtk-2 <<EOD
 setdesc $@
 settitle pw
 message
 EOD
+		fi
 	fi
 }
 
@@ -186,11 +196,7 @@ clip() {
 		[[ $now != $(echo -n "$1" | base64) ]] && before="$now"
 		echo "$before" | base64 -d | xclip -selection clipboard
 	) 2>/dev/null & disown
-	if [ -t 0 ]; then
-		echo "Copied $2 to clipboard. Will clear in $CLIP_TIME seconds."
-	else
-		notify-send "pw" "Copied $2 to clipboard. Will clear in $CLIP_TIME seconds."
-	fi
+	say softly "Copied $2 to clipboard. Will clear in $CLIP_TIME seconds."
 }
 
 #
